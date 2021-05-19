@@ -9,6 +9,7 @@
 
 use std::convert::TryInto;
 use std::error::Error;
+use std::io::SeekFrom;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail};
@@ -19,13 +20,15 @@ use lazy_static::lazy_static;
 use postgres_protocol::message::backend::{
     LogicalReplicationMessage, ReplicationMessage, Tuple, TupleData,
 };
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio_postgres::config::{Config, ReplicationMode};
 use tokio_postgres::error::{DbError, Severity, SqlState};
 use tokio_postgres::replication::LogicalReplicationStream;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
-use crate::source::{SimpleSource, SourceError, Timestamper};
+use crate::source::{SimpleSource, SourceError, SourceTransaction, Timestamper};
 use dataflow_types::{PostgresSourceConnector, SourceErrorDetails};
 use repr::{Datum, Row};
 
@@ -91,8 +94,12 @@ impl PostgresSourceReader {
     ///
     /// After the initial snapshot has been produced it returns the name of the created slot and
     /// the LSN at which we should start the replication stream at.
-    async fn produce_snapshot(&mut self, timestamper: &Timestamper) -> Result<(), anyhow::Error> {
-        let client = self.connect_replication().await?;
+    async fn produce_snapshot(
+        &mut self,
+        snapshot_tx: &mut SourceTransaction<'_>,
+        buffer: &mut BufReader<BufWriter<File>>,
+    ) -> Result<(), ReplicationError> {
+        let client = try_recoverable!(self.connect_replication().await);
 
         // We're initialising this source so any previously existing slot must be removed and
         // re-created. Once we have data persistence we will be able to reuse slots across restarts
@@ -104,50 +111,55 @@ impl PostgresSourceReader {
             .await;
 
         // Get all the relevant tables for this publication
-        let publication_tables =
+        let publication_tables = try_recoverable!(
             postgres_util::publication_info(&self.connector.conn, &self.connector.publication)
-                .await?;
+                .await
+        );
 
         // Start a transaction and immediatelly create a replication slot with the USE SNAPSHOT
         // directive. This makes the starting point of the slot and the snapshot of the transaction
         // identical.
-        client
-            .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
-            .await?;
+        try_recoverable!(
+            client
+                .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
+                .await
+        );
 
         let slot_query = format!(
             r#"CREATE_REPLICATION_SLOT {:?} LOGICAL "pgoutput" USE_SNAPSHOT"#,
             &self.connector.slot_name
         );
-        let slot_row = client
-            .simple_query(&slot_query)
-            .await?
+        let slot_row = try_recoverable!(client.simple_query(&slot_query).await)
             .into_iter()
             .next()
             .and_then(|msg| match msg {
                 SimpleQueryMessage::Row(row) => Some(row),
                 _ => None,
             })
-            .ok_or_else(|| anyhow!("empty result after creating replication slot"))?;
+            .ok_or_else(|| {
+                ReplicationError::Recoverable(anyhow!(
+                    "empty result after creating replication slot"
+                ))
+            })?;
 
         // Store the lsn at which we will need to start the replication stream from
-        self.lsn = slot_row
+        let consistent_point = try_recoverable!(slot_row
             .get("consistent_point")
-            .ok_or_else(|| anyhow!("missing expected column: `consistent_point`"))?
+            .ok_or_else(|| anyhow!("missing expected column: `consistent_point`")));
+        self.lsn = try_fatal!(consistent_point
             .parse()
-            .or_else(|_| Err(anyhow!("invalid lsn")))?;
-
-        let snapshot_tx = timestamper.start_tx().await;
+            .or_else(|_| Err(anyhow!("invalid lsn"))));
 
         for info in publication_tables {
             // TODO(petrosagg): use a COPY statement here for more efficient network transfer
-            let data = client
-                .simple_query(&format!(
-                    "SELECT * FROM {:?}.{:?}",
-                    info.namespace, info.name
-                ))
-                .await?;
-
+            let data = try_recoverable!(
+                client
+                    .simple_query(&format!(
+                        "SELECT * FROM {:?}.{:?}",
+                        info.namespace, info.name
+                    ))
+                    .await
+            );
             for msg in data {
                 if let SimpleQueryMessage::Row(row) = msg {
                     let mut mz_row = Row::default();
@@ -157,12 +169,34 @@ impl PostgresSourceReader {
                         let a: Datum = row.get(n).into();
                         a
                     }));
-                    snapshot_tx.insert(mz_row).await?;
+                    try_recoverable!(snapshot_tx.insert(mz_row.clone()).await);
+                    try_fatal!(buffer.write(&try_fatal!(bincode::serialize(&mz_row))).await);
+                    try_fatal!(buffer.write(&[b'\n']).await);
+                }
+            }
+        }
+        try_recoverable!(client.simple_query("COMMIT;").await);
+        Ok(())
+    }
+
+    /// Reverts a failed snapshot by deleting any processed rows from the dataflow.
+    async fn revert_snapshot(
+        &self,
+        snapshot_tx: &mut SourceTransaction<'_>,
+        buffer: &mut BufReader<BufWriter<File>>,
+    ) -> Result<(), anyhow::Error> {
+        buffer.seek(SeekFrom::Start(0)).await?;
+        loop {
+            let mut bytes = Vec::new();
+            match buffer.read_until(b'\n', &mut bytes).await? {
+                0 => break,
+                _ => {
+                    let mz_row: Row = bincode::deserialize(&bytes)?;
+                    snapshot_tx.delete(mz_row).await?;
                 }
             }
         }
 
-        client.simple_query("COMMIT;").await?;
         Ok(())
     }
 
@@ -343,13 +377,49 @@ impl PostgresSourceReader {
 impl SimpleSource for PostgresSourceReader {
     /// The top-level control of the state machine and retry logic
     async fn start(mut self, timestamper: &Timestamper) -> Result<(), SourceError> {
-        // The initial snapshot has no easy way of retrying it in case of connection failures
-        self.produce_snapshot(timestamper)
-            .await
-            .map_err(|e| SourceError {
-                source_name: self.source_name.clone(),
-                error: SourceErrorDetails::Initialization(e.to_string()),
-            })?;
+        // Buffer rows from snapshot to retract and retry, if initial snapshot fails.
+        // Postgres sources cannot proceed without a successful snapshot.
+        {
+            let mut snapshot_tx = timestamper.start_tx().await;
+            loop {
+                let file = File::from_std(tempfile::tempfile().map_err(|e| SourceError {
+                    source_name: self.source_name.clone(),
+                    error: SourceErrorDetails::FileIO(e.to_string()),
+                })?);
+                let mut buffer = BufReader::new(BufWriter::new(file));
+                match self.produce_snapshot(&mut snapshot_tx, &mut buffer).await {
+                    Ok(_) => {
+                        log::info!(
+                            "replication snapshot for source {} succeeded",
+                            &self.source_name
+                        );
+                        break;
+                    }
+                    Err(ReplicationError::Recoverable(e)) => {
+                        log::warn!(
+                            "replication snapshot for source {} failed, retrying: {}",
+                            &self.source_name,
+                            e
+                        );
+                        self.revert_snapshot(&mut snapshot_tx, &mut buffer)
+                            .await
+                            .map_err(|e| SourceError {
+                                source_name: self.source_name.clone(),
+                                error: SourceErrorDetails::FileIO(e.to_string()),
+                            })?;
+                    }
+                    Err(ReplicationError::Fatal(e)) => {
+                        return Err(SourceError {
+                            source_name: self.source_name,
+                            error: SourceErrorDetails::Initialization(e.to_string()),
+                        })
+                    }
+                }
+
+                // TODO(petrosagg): implement exponential back-off
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
 
         loop {
             match self.produce_replication(timestamper).await {
