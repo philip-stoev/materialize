@@ -281,6 +281,14 @@ steps:
           composition: kafka-exactly-once
           run: kafka-exactly-once
 
+  - id: upgrade
+    label: "Upgrade tests"
+    depends_on: build
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: upgrade
+          run: upgrade
+
   - id: mzcompose-self
     label: "mzcompose self test"
     timeout_in_minutes: 10
